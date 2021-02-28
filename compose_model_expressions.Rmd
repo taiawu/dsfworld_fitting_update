@@ -1,0 +1,300 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(dsfworld)
+library(tidymodels)
+
+range_norm <- function(vec) {
+  BBmisc::normalize(vec, method = "range", range = c(0,1))
+}
+```
+
+```{r}
+data <- label_data(data = read_qtower("sample_data/Exp1086--20210219_OGT_OTL_TPR_L3Pra_DR_straight_ramp.csv"),
+                   layout = read_plate_layout("sample_data/Exp1086--20210217_OGT_OTL_TPR_L3Pra_repeat_DR_sr_layout.csv"))
+
+test_data <- data %>%
+  filter(well %in% c("A5", "B5", "C5"),
+         channel_f == "TAMRA")
+
+test_data %>% ggplot(aes(x = Temperature, y = value, group = well)) + geom_line()
+
+## prepare the data
+test_by_var <- test_data %>%
+                    select(well, Temperature, value) %>%
+                    group_by(well) %>%
+                    mutate(value_norm = range_norm(value),
+                           Temperature_norm = range_norm(Temperature)) %>%
+                    nest()
+
+test_one <- test_by_var %>%
+  filter(well == "A5") %>%
+  unnest(cols = c(data)) %>%
+  ungroup() %>%
+  select(Temperature_norm, value_norm)
+
+  test_one %>% ggplot(aes(x = Temperature_norm, y = value_norm)) + geom_line() + labs(title = "Test one dataset")
+```
+
+
+
+
+The goal of this notebook is to figure out how to compose models effiicently from simple expressions of their components. 
+e.g. model 2 would be decay_sigmoid(1) + decay_sigmoid(2), while model 1 would be decay_sigmoid(1), or someting like that.
+
+
+Adapting this to our models
+```{r}
+library(glue)
+library(minpack.lm)
+   
+make_sigmoid <- function(subscript) {
+  glue::glue("Asym{subscript}/(1 + exp((xmid{subscript} - Temperature_norm)/scal{subscript}))*exp(d{subscript} * (Temperature_norm - xmid{subscript}))")
+}
+
+make_decay <- function(subscript) { glue::glue("id_d{subscript} * exp(Temperature_norm* id_b{subscript})")
+}
+
+compose_formula <- function( y_name = "value_norm", n_sigmoid, n_decay, additional_components = NULL ) {
+
+    if (n_sigmoid > 0 ) { sigmoids <- sapply(c(1:n_sigmoid), make_sigmoid) 
+  } else { sigmoids <- NULL}
+  
+    if (n_decay > 0 ) { decays <- sapply(c(1:n_decay), make_decay)
+  } else { decays <- NULL}
+  
+  paste(y_name, 
+        paste(c(sigmoids, decays, decays), collapse = " + "),
+        sep = "~") %>%
+  as.formula()
+  
+}
+
+# compose all 6 models
+model_1_formula <- compose_formula(n_sigmoid = 1, n_decay = 0 )
+model_2_formula <- compose_formula(n_sigmoid = 1, n_decay = 1 )
+model_3_formula <- compose_formula(n_sigmoid = 2, n_decay = 0 )
+model_4_formula <- compose_formula(n_sigmoid = 2, n_decay = 1 )
+model_5_formula <- compose_formula(n_sigmoid = 3, n_decay = 0 )
+model_6_formula <- compose_formula(n_sigmoid = 3, n_decay = 1 )
+
+
+compose_dsf_model <- function(model_formula, 
+                          df, 
+                          start_pars,
+                          lower_pars,
+                          control_list = list(maxiter = 500),
+                          ...) {
+                # minpack.lm::nlsLM(model_formula,
+                #     data = df,
+                #     start = start_pars,
+                #     lower = lower_pars,
+                #     control = control_list,
+                #     ...)
+  
+            tryCatch(
+
+              nslLM(model_formula,
+                    data = df,
+                    start = start_pars,
+                    lower = lower_pars,
+                    control = control_list,
+                    ...),
+
+              warning = function(w) return(NA), error = function(e) return(NA)
+
+            )
+            
+}
+
+handle_fits <- function( df_fit) {
+  df_fit %>%# fit the model, adding it as a column to the nested dataframe
+    mutate(
+      model_pars = purrr::map(model, broom::tidy), # extract model parameters
+      xmid_start = map2(data, peaks, make_peak_bool),
+      broom_aug = map2(model, data, broom::augment),
+      resids = purrr::map2(data, model, add_residuals), # add the residuals to the model, model is the column we created earlier, not the actual model
+      predictions = purrr::map2(data, model, add_predictions), # model is the column we created earlier, not the actual model itself
+      glance = purrr::map(model, broom::glance)
+    ) 
+}
+
+model_4_formula
+
+.start_pars <- list(Asym1 = 1, xmid1 = 0.6  , scal1 = 0.03, d1 = -1)
+.lower_pars <- c(Asym1 = .1, xmid1 = 0.1, scal1 = 0.01, d1 = -10)
+
+.start_pars_m4 <- list(Asym1 = 1,    xmid1 = 0.4,  scal1 = 0.03,  d1 = -1,
+                       Asym2 = 0.5, xmid2 = 0.6, scal2 = 0.03, d2 = -2,
+                       id_d1 = 0.2, id_b1 = -5)
+
+.lower_pars_m4 <-  c(Asym1 = .01, xmid1 = 0.1, scal1 = 0.01, d1 = -10,
+                    Asym2 = .01, xmid2 = 0.1, scal2 = 0.01, d2 = -10,
+                    id_d1 = 0.01, id_b1 = -20)
+
+test_model <- compose_dsf_model(model_formula = model_4_formula,
+                                df = test_one,
+                                start_pars = .start_pars_m4,
+                                lower_pars = .lower_pars_m4
+                                )
+
+# examine parameters
+test_model %>% broom::tidy()
+
+# make predictions
+
+model_pred <- test_one %>%
+               mutate(pred_value = predict(test_model, new_data = .data$Temperature_norm)) %>%
+               pivot_longer(-Temperature_norm, names_to = "which_val", values_to = "value")
+
+ggplot(model_pred, aes(x = Temperature_norm, y = value, color = which_val)) + geom_line()
+
+```
+
+```{r}
+new_points <- test_one$Temperature_norm
+
+model_pred <- test_one %>%
+               mutate(pred_value = predict(test_model, new_data = .data$Temperature_norm)) %>%
+               pivot_longer(-Temperature_norm, names_to = "which_val", values_to = "value")
+
+mean_pred <- predict(test_model, new_data = new_points)
+
+conf_int_pred <- stats::predict(test_model, 
+                         new_data = new_points, 
+                         type = "conf_int")
+
+conf_int_pred
+
+plot_data <- 
+  new_points %>% 
+  bind_cols(mean_pred) %>% 
+  bind_cols(conf_int_pred) %>%
+  set_names(c("x", "pred", "CI_pred"))
+
+plot_data
+
+ggplot(plot_data, aes(x = x)) + 
+  geom_point(aes(y = pred)) + 
+  geom_errorbar(aes(ymin = .pred_lower, 
+                    ymax = .pred_upper),
+                width = .2) + 
+  labs(y = "urchin size")
+
+```
+
+```{r}
+library(tidymodels)  # for the parsnip package, along with the rest of tidymodels
+
+# Helper packages
+library(readr)       # for importing data
+library(broom.mixed) # for converting bayesian models to tidy tibbles
+library(dotwhisker)  # for visualizing regression results
+
+urchins <-
+  # Data were assembled for a tutorial 
+  # at https://www.flutterbys.com.au/stats/tut/tut7.5a.html
+  read_csv("https://tidymodels.org/start/models/urchins.csv") %>% 
+  # Change the names to be a little more verbose
+  setNames(c("food_regime", "initial_volume", "width")) %>% 
+  # Factors are very helpful for modeling, so we convert one column
+  mutate(food_regime = factor(food_regime, levels = c("Initial", "Low", "High")))
+
+lm_mod <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+lm_fit <- 
+  lm_mod %>% 
+  fit(width ~ initial_volume * food_regime, data = urchins)
+
+tidy(lm_fit) %>% 
+  dwplot(dot_args = list(size = 2, color = "black"),
+         whisker_args = list(color = "black"),
+         vline = geom_vline(xintercept = 0, colour = "grey50", linetype = 2))
+
+new_points <- expand.grid(initial_volume = 20, 
+                          food_regime = c("Initial", "Low", "High"))
+new_points
+#>   initial_volume food_regime
+#> 1             20     Initial
+#> 2             20         Low
+#> 3             20        High
+
+mean_pred <- predict(lm_fit, new_data = new_points)
+
+conf_int_pred <- stats::predict(lm_fit, 
+                         new_data = new_points, 
+                         type = "conf_int")
+conf_int_pred
+
+```
+
+
+
+
+```{r}
+# 
+# s2_d_model <- function(df, par_start) {# runs fine
+#   xmid1 <- df[par_start,]$Temperature_norm[1]
+#   if (is.na(xmid1) == TRUE ) {xmid1 <- 0.6} # when wil this be NA, anyway? catch this
+#   xmid2 <- df[par_start,]$Temperature_norm[2]
+#   if (is.na(xmid2) == TRUE ) {xmid2 <- 0.62} # when wil this be NA, anyway? catch this
+#   
+#   id_d_start <- df$value_norm[1] # the initial value
+#   
+#   tryCatch(
+#     nlsLM(value_norm ~ Asym/(1 + exp((xmid - Temperature_norm)/scal))*exp(d * (Temperature_norm - xmid)) +
+#             Asym2/(1 + exp((xmid2 - Temperature_norm)/scal2))*exp(d2 * (Temperature_norm - xmid2)) +
+#             id_d * exp(Temperature_norm* id_b),
+#           
+#           data = df,
+#           start = list(Asym = 1,    xmid = xmid1,  scal = 0.03,  d = -1,
+#                        Asym2 = 0.5, xmid2 = xmid2, scal2 = 0.03, d2 = -2,
+#                        id_d = id_d_start, id_b = -5
+#           ),
+#           lower = c(Asym = .01, xmid = 0.1, scal = 0.01, d = -10,
+#                     Asym2 = .01, xmid2 = 0.1, scal2 = 0.01, d2 = -10,
+#                     id_d = 0.01, id_b = -20
+#           ),
+#           
+#           control = list(maxiter = 500)
+#     ),
+#     warning = function(w) return(NA), error = function(e) return(NA)
+#   )
+#   
+# }
+
+```
+
+
+
+
+A formals()-based approach for data-dependent defaults on savistky-golay filtering
+```{r}
+# This is the funamdental sgolay code, with default values
+sgolay <- function(x, p, n, m) sgolayfilt(x, p = 5, n = 13, m)
+
+# here, we set new defaults based on the user's data
+formals(sgolay) <- alist(x = , # user supplies data
+                    p = win3d, # this is calculated from the data
+                    n = calc_span, # this is calculated from the data
+                    m = ) # user chooses filter order 
+
+# sgolay(value, 1) # this should return the first derivative of the value vector
+```
+
+
+
+
+
+
+
+
+
+
